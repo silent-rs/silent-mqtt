@@ -1,0 +1,11 @@
+[package]
+name = "silent-mqtt"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Hubert Shelley <hubertshelley@163.com>"]
+homepage = "https://github.com/silent-rs/silent"
+readme = "./README.md"
+repository = "https://github.com/silent-rs/silent"
+
+[dependencies]
