@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::Local;
 use silent::BoxError;
 use silent::Connection;
-use silent::NetServer;
+use silent::Server;
 use silent::SocketAddr as SilentSocketAddr;
 use tokio::io::AsyncWriteExt;
 
@@ -22,14 +22,16 @@ use protocol::{ConnAckPacket, ConnectPacket, ConnectReturnCode, ProtocolError};
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let addr: SocketAddr = "0.0.0.0:1883".parse().expect("invalid bind address");
-    let server = NetServer::bind(addr).expect("failed to start listener");
-    for addr in server.local_addrs() {
-        println!("silent-mqtt broker listening on {}", addr);
-    }
     let broker = Broker::new();
 
-    server
-        .run(move |stream, peer| {
+    Server::new()
+        .bind(addr)
+        .on_listen(|addrs| {
+            for addr in addrs {
+                println!("silent-mqtt broker listening on {}", addr);
+            }
+        })
+        .serve(move |stream, peer| {
             let broker = broker.clone();
             async move {
                 handle_client(stream, peer, broker)
@@ -37,7 +39,8 @@ async fn main() -> io::Result<()> {
                     .map_err(|err| -> BoxError { Box::new(err) })
             }
         })
-        .await
+        .await;
+    Ok(())
 }
 
 async fn handle_client(
