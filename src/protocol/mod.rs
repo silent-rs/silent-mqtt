@@ -243,8 +243,17 @@ pub struct ConnectPacket {
     pub client_id: String,
     pub clean_session: bool,
     pub keep_alive: u16,
+    pub will: Option<LastWill>,
     pub username: Option<String>,
     pub password: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastWill {
+    pub topic: String,
+    pub message: Vec<u8>,
+    pub qos: u8,
+    pub retain: bool,
 }
 
 impl ConnectPacket {
@@ -299,9 +308,11 @@ impl ConnectPacket {
         }
         let clean_session = (connect_flags & 0x02) != 0;
         let will_flag = (connect_flags & 0x04) != 0;
-        if will_flag {
-            return Err(ProtocolError::WillFlagNotSupported);
+        let will_qos = (connect_flags & 0x18) >> 3;
+        if will_qos > 1 {
+            return Err(ProtocolError::UnsupportedQoS(will_qos));
         }
+        let will_retain = (connect_flags & 0x20) != 0;
         let password_flag = (connect_flags & 0x40) != 0;
         let username_flag = (connect_flags & 0x80) != 0;
         if password_flag && !username_flag {
@@ -310,6 +321,19 @@ impl ConnectPacket {
 
         let keep_alive = read_u16(src, &mut cursor, end)?;
         let client_id = read_utf8_string(src, &mut cursor, end)?.to_string();
+
+        let last_will = if will_flag {
+            let topic = read_utf8_string(src, &mut cursor, end)?.to_string();
+            let message = read_binary_data(src, &mut cursor, end)?;
+            Some(LastWill {
+                topic,
+                message,
+                qos: will_qos,
+                retain: will_retain,
+            })
+        } else {
+            None
+        };
 
         let username = if username_flag {
             Some(read_utf8_string(src, &mut cursor, end)?.to_string())
@@ -328,6 +352,7 @@ impl ConnectPacket {
                 client_id,
                 clean_session,
                 keep_alive,
+                will: last_will,
                 username,
                 password,
             },
@@ -345,6 +370,16 @@ impl ConnectPacket {
         if self.clean_session {
             flags |= 0x02;
         }
+        if let Some(will) = &self.will {
+            if will.qos > 1 {
+                return Err(ProtocolError::UnsupportedQoS(will.qos));
+            }
+            flags |= 0x04;
+            flags |= (will.qos & 0x03) << 3;
+            if will.retain {
+                flags |= 0x20;
+            }
+        }
         if self.username.is_some() {
             flags |= 0x80;
         }
@@ -357,6 +392,10 @@ impl ConnectPacket {
         variable.push(flags);
         variable.extend_from_slice(&self.keep_alive.to_be_bytes());
         write_utf8_string(&mut variable, &self.client_id)?;
+        if let Some(will) = &self.will {
+            write_utf8_string(&mut variable, &will.topic)?;
+            write_binary_data(&mut variable, &will.message)?;
+        }
         if let Some(username) = &self.username {
             write_utf8_string(&mut variable, username)?;
         }
@@ -505,8 +544,6 @@ pub enum ProtocolError {
     UnsupportedProtocolLevel(u8),
     #[error("reserved connect flag must be zero")]
     InvalidConnectFlags,
-    #[error("will message is not supported yet")]
-    WillFlagNotSupported,
     #[error("password flag requires username flag")]
     PasswordFlagRequiresUsername,
     #[error("string field contains invalid UTF-8")]

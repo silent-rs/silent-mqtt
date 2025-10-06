@@ -3,6 +3,12 @@
 ## 背景
 构建基于 Silent 框架的最小可运行 MQTT Broker，以验证 Silent 在生产环境的潜力。
 
+## Silent Odyssey 对齐目标
+- 作为 Silent Odyssey 第一阶段产出，需要提供一个可验证的 MQTT Broker，以证明 Silent 协议层的可扩展性。
+- Broker 必须支持基础互通（以 mosquitto 客户端为基准），并输出最小可行示例。
+- 需要沉淀协议适配经验，形成可复用的 `Protocol` 实现范式，便于后续在 Odyssey 中扩展更多网络协议。
+- 在 Odyssey 规划中，本项目需为性能验证打基础，至少提供压测基线（连接数、吞吐、延迟）供后续阶段对比。
+
 ## 技术栈与基础要求
 - 编程语言：Rust。
 - 运行时：Tokio 异步运行时。
@@ -14,11 +20,12 @@
 ## 协议支持范围（MQTT 3.1.1 核心子集）
 1. CONNECT / CONNACK
 2. SUBSCRIBE / SUBACK
-3. PUBLISH / PUBACK（支持 QoS 0/1）
-4. PINGREQ / PINGRESP
+3. PUBLISH / PUBACK（支持 QoS 0/1，后续扩展 QoS 2）
+4. PINGREQ / PINGRESP（保活检测，超时断开并触发遗嘱）
 5. DISCONNECT
+6. 遗嘱消息（Last Will Message）
 
-以下功能暂不实现：QoS 2、遗嘱消息、持久会话等高级特性。
+以下功能暂不实现：QoS 2、持久会话等高级特性。
 
 ## 架构规划
 ```

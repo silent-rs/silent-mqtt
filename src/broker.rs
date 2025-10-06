@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use chrono::Local;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
 use crate::client::ClientCommand;
-use crate::protocol::{PublishPacket, SubscribeReturnCode};
+use crate::protocol::{LastWill, PublishPacket, SubscribeReturnCode};
 
 #[derive(Clone)]
 struct Subscriber {
@@ -118,5 +119,17 @@ impl Broker {
             packet.payload.len(),
             packet.qos
         );
+    }
+
+    pub async fn publish_will(self: &Arc<Self>, will: &LastWill) {
+        let packet = PublishPacket {
+            dup: false,
+            qos: will.qos,
+            retain: will.retain,
+            topic_name: will.topic.clone(),
+            packet_identifier: None,
+            payload: Bytes::from(will.message.clone()),
+        };
+        self.publish("$will", &packet).await;
     }
 }

@@ -15,10 +15,11 @@
 ## 🧪 功能范围
 - ✅ CONNECT / CONNACK
 - ✅ SUBSCRIBE / SUBACK
-- ✅ PUBLISH / PUBACK（QoS 0/1/2）
+- ✅ PUBLISH / PUBACK（QoS 0/1）
 - ✅ DISCONNECT
-- 🚧 保活心跳（Keep Alive）
-- 🚧 遗嘱消息（Last Will）
+- ✅ 保活心跳（Keep Alive）
+- ✅ 遗嘱消息（Last Will）
+- 🚧 QoS 2 流程（PUBREL/PUBCOMP）
 
 ---
 

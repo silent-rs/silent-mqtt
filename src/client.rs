@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::Local;
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::broker::Broker;
 use crate::protocol::{
-    ConnectPacket, MqttMessage, MqttProtocol, MqttResponse, ProtocolError, PubAckPacket,
+    ConnectPacket, LastWill, MqttMessage, MqttProtocol, MqttResponse, ProtocolError, PubAckPacket,
     PublishPacket, SubAckPacket, SubscribePacket,
 };
 
@@ -26,6 +27,7 @@ pub struct ClientSession {
     reader: ReadHalf<ClientStream>,
     outbound: mpsc::UnboundedSender<ClientCommand>,
     broker: Arc<Broker>,
+    will: Option<LastWill>,
 }
 
 pub enum ClientCommand {
@@ -76,6 +78,7 @@ impl ClientSession {
             reader,
             outbound: tx.clone(),
             broker: broker.clone(),
+            will: connect.will.clone(),
         };
 
         println!(
@@ -87,9 +90,10 @@ impl ClientSession {
             connect.keep_alive
         );
 
-        let read_result = session.read_loop(connect.keep_alive).await;
+        let keep_alive = connect.keep_alive;
+        let read_result = session.read_loop(keep_alive).await;
 
-        let (client_id, broker, outbound) = session.into_parts();
+        let (client_id, broker, outbound, will) = session.into_parts();
         broker.unregister_client(&client_id).await;
         drop(outbound);
 
@@ -98,15 +102,55 @@ impl ClientSession {
             Err(err) => Err(ClientError::Io(err)),
         };
 
+        let mut deliver_will =
+            matches!(read_result, Ok(SessionEnd::Abnormal)) || read_result.is_err();
+        if writer_result.is_err() {
+            deliver_will = true;
+        }
+
+        if deliver_will && let Some(ref last_will) = will {
+            broker.publish_will(last_will).await;
+        }
+
         writer_result?;
-        read_result
+
+        match read_result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
-    async fn read_loop(&mut self, _keep_alive: u16) -> Result<(), ClientError> {
+    async fn read_loop(&mut self, keep_alive: u16) -> Result<SessionEnd, ClientError> {
+        let timeout_duration = if keep_alive == 0 {
+            None
+        } else {
+            let secs = (keep_alive as u64).saturating_mul(3).div_ceil(2);
+            Some(Duration::from_secs(secs.max(1)))
+        };
         loop {
-            let packet = read_packet(&mut self.reader).await?;
+            let packet = if let Some(duration) = timeout_duration {
+                match tokio::time::timeout(duration, read_packet(&mut self.reader)).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        println!(
+                            "[{}] client {} keep-alive timeout ({}s)",
+                            Local::now().naive_local(),
+                            self.id,
+                            keep_alive
+                        );
+                        return Ok(SessionEnd::Abnormal);
+                    }
+                }
+            } else {
+                read_packet(&mut self.reader).await?
+            };
             if packet.is_empty() {
-                return Ok(());
+                println!(
+                    "[{}] client {} closed connection",
+                    Local::now().naive_local(),
+                    self.id
+                );
+                return Ok(SessionEnd::Abnormal);
             }
             let message = MqttProtocol::into_internal(packet).map_err(ClientError::from)?;
             match message {
@@ -119,7 +163,7 @@ impl ClientSession {
                         Local::now().naive_local(),
                         self.id
                     );
-                    return Ok(());
+                    return Ok(SessionEnd::Clean);
                 }
                 MqttMessage::Connect(_) => {
                     return Err(ClientError::Protocol(ProtocolError::InvalidPacketType(
@@ -178,9 +222,21 @@ impl ClientSession {
             .map_err(|_| ClientError::ChannelClosed)
     }
 
-    fn into_parts(self) -> (String, Arc<Broker>, mpsc::UnboundedSender<ClientCommand>) {
-        (self.id, self.broker, self.outbound)
+    fn into_parts(
+        self,
+    ) -> (
+        String,
+        Arc<Broker>,
+        mpsc::UnboundedSender<ClientCommand>,
+        Option<LastWill>,
+    ) {
+        (self.id, self.broker, self.outbound, self.will)
     }
+}
+
+enum SessionEnd {
+    Clean,
+    Abnormal,
 }
 
 pub async fn read_packet<R>(reader: &mut R) -> io::Result<Vec<u8>>
