@@ -54,7 +54,7 @@ impl SubscribePacket {
                 return Err(ProtocolError::EmptyTopicFilter);
             }
             let qos = read_u8(src, &mut cursor, end)?;
-            if qos > 1 {
+            if qos > 2 {
                 return Err(ProtocolError::UnsupportedQoS(qos));
             }
             subscriptions.push(Subscription { topic_filter, qos });
@@ -79,6 +79,7 @@ impl SubscribePacket {
 pub enum SubscribeReturnCode {
     SuccessQoS0 = 0x00,
     SuccessQoS1 = 0x01,
+    SuccessQoS2 = 0x02,
     Failure = 0x80,
 }
 
@@ -136,7 +137,7 @@ impl PublishPacket {
         let dup = (control_byte & 0x08) != 0;
         let qos = (control_byte & 0x06) >> 1;
         let retain = (control_byte & 0x01) != 0;
-        if qos > 1 {
+        if qos > 2 {
             return Err(ProtocolError::UnsupportedQoS(qos));
         }
         if qos == 0 && dup {
@@ -186,7 +187,7 @@ impl PublishPacket {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
-        if self.qos > 1 {
+        if self.qos > 2 {
             return Err(ProtocolError::UnsupportedQoS(self.qos));
         }
         if self.qos == 0 && self.packet_identifier.is_some() {
@@ -558,6 +559,8 @@ pub enum ProtocolError {
     InvalidConnAckFlags(u8),
     #[error("invalid CONNACK return code: {0:#x}")]
     InvalidReturnCode(u8),
+    #[error("invalid ack remaining length for packet {packet:#x}: {length}")]
+    InvalidAckLength { packet: u8, length: usize },
 }
 
 fn decode_remaining_length(src: &[u8]) -> Result<(usize, usize), ProtocolError> {
@@ -662,11 +665,55 @@ fn write_binary_data(dst: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolErro
     Ok(())
 }
 
+fn decode_ack_packet(
+    src: &[u8],
+    packet_type: u8,
+    expected_flags: u8,
+) -> Result<u16, ProtocolError> {
+    if src.len() < 4 {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    let header = src[0];
+    let r#type = header >> 4;
+    let flags = header & 0x0F;
+    if r#type != packet_type {
+        return Err(ProtocolError::InvalidPacketType(r#type));
+    }
+    if flags != expected_flags {
+        return Err(ProtocolError::InvalidPacketFlags(flags));
+    }
+    let (remaining_length, remaining_len_bytes) = decode_remaining_length(&src[1..])?;
+    if remaining_length != 2 {
+        return Err(ProtocolError::InvalidAckLength {
+            packet: packet_type,
+            length: remaining_length,
+        });
+    }
+    let header_len = 1 + remaining_len_bytes;
+    if src.len() < header_len + 2 {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    Ok(u16::from_be_bytes([src[header_len], src[header_len + 1]]))
+}
+
+fn encode_ack_packet(packet_type: u8, flags: u8, packet_identifier: u16) -> Vec<u8> {
+    vec![
+        (packet_type << 4) | flags,
+        0x02,
+        (packet_identifier >> 8) as u8,
+        (packet_identifier & 0xFF) as u8,
+    ]
+}
+
 /// 框架内部使用的 MQTT 消息枚举。
 pub enum MqttMessage {
     Connect(ConnectPacket),
     Subscribe(SubscribePacket),
     Publish(PublishPacket),
+    PubAck(u16),
+    PubRec(u16),
+    PubRel(u16),
+    PubComp(u16),
     PingReq,
     Disconnect,
 }
@@ -676,6 +723,9 @@ pub enum MqttResponse {
     ConnAck(ConnAckPacket),
     SubAck(SubAckPacket),
     PubAck(PubAckPacket),
+    PubRec(u16),
+    PubRel(u16),
+    PubComp(u16),
     PingResp,
 }
 
@@ -730,6 +780,22 @@ impl Protocol for MqttProtocol {
                 let (packet, _) = PublishPacket::decode(&message)?;
                 Ok(MqttMessage::Publish(packet))
             }
+            0x04 => {
+                let packet_identifier = decode_ack_packet(&message, 0x04, 0x00)?;
+                Ok(MqttMessage::PubAck(packet_identifier))
+            }
+            0x05 => {
+                let packet_identifier = decode_ack_packet(&message, 0x05, 0x00)?;
+                Ok(MqttMessage::PubRec(packet_identifier))
+            }
+            0x06 => {
+                let packet_identifier = decode_ack_packet(&message, 0x06, 0x02)?;
+                Ok(MqttMessage::PubRel(packet_identifier))
+            }
+            0x07 => {
+                let packet_identifier = decode_ack_packet(&message, 0x07, 0x00)?;
+                Ok(MqttMessage::PubComp(packet_identifier))
+            }
             0x0C => Ok(MqttMessage::PingReq),
             0x0E => Ok(MqttMessage::Disconnect),
             _ => Err(ProtocolError::InvalidPacketType(packet_type)),
@@ -741,6 +807,15 @@ impl Protocol for MqttProtocol {
             MqttResponse::ConnAck(packet) => Ok(Some(packet.encode())),
             MqttResponse::SubAck(packet) => packet.encode().map(Some),
             MqttResponse::PubAck(packet) => packet.encode().map(Some),
+            MqttResponse::PubRec(packet_identifier) => {
+                Ok(Some(encode_ack_packet(0x05, 0x00, packet_identifier)))
+            }
+            MqttResponse::PubRel(packet_identifier) => {
+                Ok(Some(encode_ack_packet(0x06, 0x02, packet_identifier)))
+            }
+            MqttResponse::PubComp(packet_identifier) => {
+                Ok(Some(encode_ack_packet(0x07, 0x00, packet_identifier)))
+            }
             MqttResponse::PingResp => Ok(Some(vec![0xD0, 0x00])),
         }
     }

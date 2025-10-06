@@ -58,10 +58,11 @@ impl Broker {
             None => return SubscribeReturnCode::Failure,
         };
 
-        let granted_qos = requested_qos.min(1);
+        let granted_qos = requested_qos.min(2);
         let return_code = match granted_qos {
             0 => SubscribeReturnCode::SuccessQoS0,
-            _ => SubscribeReturnCode::SuccessQoS1,
+            1 => SubscribeReturnCode::SuccessQoS1,
+            _ => SubscribeReturnCode::SuccessQoS2,
         };
 
         let mut subscriptions = self.subscriptions.write().await;

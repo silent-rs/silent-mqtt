@@ -1,3 +1,4 @@
+use std::collections::{HashMap, hash_map::Entry};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use silent::Protocol;
 use thiserror::Error;
 use tokio::io::split;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::broker::Broker;
 use crate::protocol::{
@@ -28,6 +29,8 @@ pub struct ClientSession {
     outbound: mpsc::UnboundedSender<ClientCommand>,
     broker: Arc<Broker>,
     will: Option<LastWill>,
+    outbound_qos2: Arc<Mutex<HashMap<u16, OutboundQoS2State>>>,
+    inbound_qos2: HashMap<u16, PublishPacket>,
 }
 
 pub enum ClientCommand {
@@ -70,7 +73,8 @@ impl ClientSession {
 
         broker.register_client(client_id.clone(), tx.clone()).await;
 
-        let writer_handle = tokio::spawn(write_loop(writer, rx));
+        let outbound_qos2 = Arc::new(Mutex::new(HashMap::new()));
+        let writer_handle = tokio::spawn(write_loop(writer, rx, outbound_qos2.clone()));
 
         let mut session = ClientSession {
             id: client_id.clone(),
@@ -79,6 +83,8 @@ impl ClientSession {
             outbound: tx.clone(),
             broker: broker.clone(),
             will: connect.will.clone(),
+            outbound_qos2,
+            inbound_qos2: HashMap::new(),
         };
 
         println!(
@@ -156,6 +162,18 @@ impl ClientSession {
             match message {
                 MqttMessage::Subscribe(subscribe) => self.handle_subscribe(subscribe).await?,
                 MqttMessage::Publish(publish) => self.handle_publish(publish).await?,
+                MqttMessage::PubAck(packet_identifier) => {
+                    self.handle_puback(packet_identifier)?;
+                }
+                MqttMessage::PubRec(packet_identifier) => {
+                    self.handle_pubrec(packet_identifier).await?;
+                }
+                MqttMessage::PubRel(packet_identifier) => {
+                    self.handle_pubrel(packet_identifier).await?;
+                }
+                MqttMessage::PubComp(packet_identifier) => {
+                    self.handle_pubcomp(packet_identifier).await?;
+                }
                 MqttMessage::PingReq => self.handle_pingreq()?,
                 MqttMessage::Disconnect => {
                     println!(
@@ -192,15 +210,73 @@ impl ClientSession {
     }
 
     async fn handle_publish(&mut self, publish: PublishPacket) -> Result<(), ClientError> {
-        self.broker.publish(&self.id, &publish).await;
-
-        if publish.qos == 1 {
-            let packet_identifier = publish
-                .packet_identifier
-                .ok_or(ProtocolError::MissingPacketIdentifier)?;
-            let puback = PubAckPacket { packet_identifier };
-            self.send_response(MqttResponse::PubAck(puback))?;
+        match publish.qos {
+            0 => {
+                self.broker.publish(&self.id, &publish).await;
+                Ok(())
+            }
+            1 => {
+                self.broker.publish(&self.id, &publish).await;
+                let packet_identifier = publish
+                    .packet_identifier
+                    .ok_or(ProtocolError::MissingPacketIdentifier)?;
+                let puback = PubAckPacket { packet_identifier };
+                self.send_response(MqttResponse::PubAck(puback))?;
+                Ok(())
+            }
+            2 => self.handle_publish_qos2(publish).await,
+            qos => Err(ClientError::from(ProtocolError::UnsupportedQoS(qos))),
         }
+    }
+
+    async fn handle_publish_qos2(&mut self, publish: PublishPacket) -> Result<(), ClientError> {
+        let packet_identifier = publish
+            .packet_identifier
+            .ok_or(ProtocolError::MissingPacketIdentifier)?;
+        match self.inbound_qos2.entry(packet_identifier) {
+            Entry::Vacant(entry) => {
+                entry.insert(publish);
+            }
+            Entry::Occupied(_) => {
+                // duplicate publish; keep original payload for exactly-once delivery
+            }
+        }
+        self.send_response(MqttResponse::PubRec(packet_identifier))?;
+        Ok(())
+    }
+
+    async fn handle_pubrel(&mut self, packet_identifier: u16) -> Result<(), ClientError> {
+        if let Some(publish) = self.inbound_qos2.remove(&packet_identifier) {
+            self.broker.publish(&self.id, &publish).await;
+        }
+        self.send_response(MqttResponse::PubComp(packet_identifier))?;
+        Ok(())
+    }
+
+    async fn handle_pubrec(&mut self, packet_identifier: u16) -> Result<(), ClientError> {
+        let should_send_pubrel = {
+            let mut pending = self.outbound_qos2.lock().await;
+            if let Some(state) = pending.get_mut(&packet_identifier) {
+                *state = OutboundQoS2State::AwaitingPubcomp;
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_send_pubrel {
+            self.send_response(MqttResponse::PubRel(packet_identifier))?;
+        }
+        Ok(())
+    }
+
+    async fn handle_pubcomp(&mut self, packet_identifier: u16) -> Result<(), ClientError> {
+        self.outbound_qos2.lock().await.remove(&packet_identifier);
+        Ok(())
+    }
+
+    fn handle_puback(&mut self, _packet_identifier: u16) -> Result<(), ClientError> {
+        // Currently QoS1 acknowledgements are treated as fire-and-forget.
         Ok(())
     }
 
@@ -237,6 +313,12 @@ impl ClientSession {
 enum SessionEnd {
     Clean,
     Abnormal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundQoS2State {
+    AwaitingPubrec,
+    AwaitingPubcomp,
 }
 
 pub async fn read_packet<R>(reader: &mut R) -> io::Result<Vec<u8>>
@@ -284,6 +366,7 @@ where
 async fn write_loop(
     mut writer: WriteHalf<ClientStream>,
     mut rx: mpsc::UnboundedReceiver<ClientCommand>,
+    pending_qos2: Arc<Mutex<HashMap<u16, OutboundQoS2State>>>,
 ) -> Result<(), io::Error> {
     let mut next_packet_id: u16 = 1;
     while let Some(cmd) = rx.recv().await {
@@ -320,6 +403,15 @@ async fn write_loop(
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
                 writer.write_all(&packet).await?;
                 writer.flush().await?;
+
+                if qos == 2
+                    && let Some(id) = packet_identifier
+                {
+                    pending_qos2
+                        .lock()
+                        .await
+                        .insert(id, OutboundQoS2State::AwaitingPubrec);
+                }
             }
         }
     }

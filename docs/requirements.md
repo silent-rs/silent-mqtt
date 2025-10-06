@@ -20,12 +20,13 @@
 ## 协议支持范围（MQTT 3.1.1 核心子集）
 1. CONNECT / CONNACK
 2. SUBSCRIBE / SUBACK
-3. PUBLISH / PUBACK（支持 QoS 0/1，后续扩展 QoS 2）
-4. PINGREQ / PINGRESP（保活检测，超时断开并触发遗嘱）
-5. DISCONNECT
-6. 遗嘱消息（Last Will Message）
+3. PUBLISH / PUBACK（支持 QoS 0/1/2）
+4. PUBREC / PUBREL / PUBCOMP（QoS 2 交互完整流程）
+5. PINGREQ / PINGRESP（保活检测，超时断开并触发遗嘱）
+6. DISCONNECT
+7. 遗嘱消息（Last Will Message）
 
-以下功能暂不实现：QoS 2、持久会话等高级特性。
+以下功能暂不实现：持久会话等高级特性。
 
 ## 架构规划
 ```
