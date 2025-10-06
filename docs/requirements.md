@@ -24,13 +24,13 @@
 ```
 src/
 ├── main.rs          # 入口，启动 TCP Listener
-├── protocol.rs      # 协议解析与编码
+├── protocol/        # 协议解析、编码与 Silent Protocol 适配
 ├── broker.rs        # Broker 核心逻辑（订阅表、消息路由）
 └── client.rs        # 客户端会话管理
 ```
 
 ## 迭代步骤
-1. **协议编解码基础**：实现 `protocol.rs` 中 CONNECT/CONNACK 报文解析与编码。
+1. **协议编解码基础**：实现 `protocol` 模块中 CONNECT/CONNACK 报文解析与编码。
 2. **基础握手流程**：在 `main.rs` 中监听 1883 端口，接入客户端，完成 CONNECT → CONNACK。
 3. **订阅与转发**：实现 SUBSCRIBE/SUBACK、PUBLISH/PUBACK，管理订阅表并转发消息。
 4. **连接保活**：支持 PINGREQ/PINGRESP 与 DISCONNECT，保证会话生命周期正确。

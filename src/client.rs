@@ -6,6 +6,7 @@ use bytes::Bytes;
 use chrono::Local;
 use scru128::scru128_string;
 use silent::BoxedConnection;
+use silent::Protocol;
 use thiserror::Error;
 use tokio::io::split;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -13,7 +14,8 @@ use tokio::sync::mpsc;
 
 use crate::broker::Broker;
 use crate::protocol::{
-    ConnectPacket, ProtocolError, PubAckPacket, PublishPacket, SubAckPacket, SubscribePacket,
+    ConnectPacket, MqttMessage, MqttProtocol, MqttResponse, ProtocolError, PubAckPacket,
+    PublishPacket, SubAckPacket, SubscribePacket,
 };
 
 pub type ClientStream = BoxedConnection;
@@ -106,12 +108,12 @@ impl ClientSession {
             if packet.is_empty() {
                 return Ok(());
             }
-            let packet_type = packet[0] >> 4;
-            match packet_type {
-                0x08 => self.handle_subscribe(&packet).await?,
-                0x03 => self.handle_publish(&packet).await?,
-                0x0C => self.handle_pingreq()?,
-                0x0E => {
+            let message = MqttProtocol::into_internal(packet).map_err(ClientError::from)?;
+            match message {
+                MqttMessage::Subscribe(subscribe) => self.handle_subscribe(subscribe).await?,
+                MqttMessage::Publish(publish) => self.handle_publish(publish).await?,
+                MqttMessage::PingReq => self.handle_pingreq()?,
+                MqttMessage::Disconnect => {
                     println!(
                         "[{}] client {} disconnected",
                         Local::now().naive_local(),
@@ -119,20 +121,16 @@ impl ClientSession {
                     );
                     return Ok(());
                 }
-                _ => {
-                    println!(
-                        "[{}] client {} sent unsupported packet type {:x}",
-                        Local::now().naive_local(),
-                        self.id,
-                        packet_type
-                    );
+                MqttMessage::Connect(_) => {
+                    return Err(ClientError::Protocol(ProtocolError::InvalidPacketType(
+                        0x01,
+                    )));
                 }
             }
         }
     }
 
-    async fn handle_subscribe(&mut self, packet: &[u8]) -> Result<(), ClientError> {
-        let (subscribe, _) = SubscribePacket::decode(packet)?;
+    async fn handle_subscribe(&mut self, subscribe: SubscribePacket) -> Result<(), ClientError> {
         let mut return_codes = Vec::with_capacity(subscribe.subscriptions.len());
         for sub in &subscribe.subscriptions {
             let granted = self
@@ -145,13 +143,11 @@ impl ClientSession {
             packet_identifier: subscribe.packet_identifier,
             return_codes,
         };
-        let bytes = suback.encode()?;
-        self.send_raw(bytes)?;
+        self.send_response(MqttResponse::SubAck(suback))?;
         Ok(())
     }
 
-    async fn handle_publish(&mut self, packet: &[u8]) -> Result<(), ClientError> {
-        let (publish, _) = PublishPacket::decode(packet)?;
+    async fn handle_publish(&mut self, publish: PublishPacket) -> Result<(), ClientError> {
         self.broker.publish(&self.id, &publish).await;
 
         if publish.qos == 1 {
@@ -159,14 +155,20 @@ impl ClientSession {
                 .packet_identifier
                 .ok_or(ProtocolError::MissingPacketIdentifier)?;
             let puback = PubAckPacket { packet_identifier };
-            let bytes = puback.encode()?;
-            self.send_raw(bytes)?;
+            self.send_response(MqttResponse::PubAck(puback))?;
         }
         Ok(())
     }
 
     fn handle_pingreq(&mut self) -> Result<(), ClientError> {
-        self.send_raw(vec![0xD0, 0x00])?;
+        self.send_response(MqttResponse::PingResp)?;
+        Ok(())
+    }
+
+    fn send_response(&self, response: MqttResponse) -> Result<(), ClientError> {
+        if let Some(bytes) = MqttProtocol::from_internal(response).map_err(ClientError::from)? {
+            self.send_raw(bytes)?;
+        }
         Ok(())
     }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use chrono::Local;
 use silent::BoxError;
 use silent::Connection;
+use silent::Protocol;
 use silent::Server;
 use silent::SocketAddr as SilentSocketAddr;
 use tokio::io::AsyncWriteExt;
@@ -17,7 +18,9 @@ mod protocol;
 
 use broker::Broker;
 use client::{ClientError, ClientSession, read_packet};
-use protocol::{ConnAckPacket, ConnectPacket, ConnectReturnCode, ProtocolError};
+use protocol::{
+    ConnAckPacket, ConnectReturnCode, MqttMessage, MqttProtocol, MqttResponse, ProtocolError,
+};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -56,7 +59,16 @@ async fn handle_client(
         }
     };
     let packet = read_packet(&mut stream).await?;
-    let (connect, _) = ConnectPacket::decode(&packet)?;
+    let packet_type = packet.first().map(|byte| byte >> 4).unwrap_or(0);
+    let message = MqttProtocol::into_internal(packet).map_err(ServerError::from)?;
+    let connect = match message {
+        MqttMessage::Connect(packet) => packet,
+        _ => {
+            return Err(ServerError::Protocol(ProtocolError::InvalidPacketType(
+                packet_type,
+            )));
+        }
+    };
     println!(
         "[{}] accepted CONNECT from {} (client_id={}, clean_session={}, keep_alive={})",
         Local::now().naive_local(),
@@ -70,8 +82,12 @@ async fn handle_client(
         session_present: false,
         return_code: ConnectReturnCode::Accepted,
     };
-    stream.write_all(&connack.encode()).await?;
-    stream.flush().await?;
+    if let Some(bytes) =
+        MqttProtocol::from_internal(MqttResponse::ConnAck(connack)).map_err(ServerError::from)?
+    {
+        stream.write_all(&bytes).await?;
+        stream.flush().await?;
+    }
 
     ClientSession::start(stream, peer_addr, connect, broker).await?;
     Ok(())

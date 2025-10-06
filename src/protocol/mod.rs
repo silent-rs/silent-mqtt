@@ -1,7 +1,11 @@
-use std::convert::TryFrom;
+use std::convert::{Infallible, TryFrom};
+use std::pin::Pin;
 use std::str;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use http_body::{Body, Frame, SizeHint};
+use silent::Protocol;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,4 +623,88 @@ fn write_binary_data(dst: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolErro
     dst.extend_from_slice(&(value.len() as u16).to_be_bytes());
     dst.extend_from_slice(value);
     Ok(())
+}
+
+/// 框架内部使用的 MQTT 消息枚举。
+pub enum MqttMessage {
+    Connect(ConnectPacket),
+    Subscribe(SubscribePacket),
+    Publish(PublishPacket),
+    PingReq,
+    Disconnect,
+}
+
+/// 框架内部使用的 MQTT 响应枚举。
+pub enum MqttResponse {
+    ConnAck(ConnAckPacket),
+    SubAck(SubAckPacket),
+    PubAck(PubAckPacket),
+    PingResp,
+}
+
+/// 用于 MQTT 协议适配的空响应体实现。
+pub struct NoopBody;
+
+impl Body for NoopBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(None)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(0)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        true
+    }
+}
+
+/// 基于 Silent `Protocol` trait 的 MQTT 适配器。
+pub struct MqttProtocol;
+
+impl Protocol for MqttProtocol {
+    type Incoming = Vec<u8>;
+    type Outgoing = Result<Option<Vec<u8>>, ProtocolError>;
+    type Body = NoopBody;
+    type InternalRequest = Result<MqttMessage, ProtocolError>;
+    type InternalResponse = MqttResponse;
+
+    fn into_internal(message: Self::Incoming) -> Self::InternalRequest {
+        if message.is_empty() {
+            return Err(ProtocolError::UnexpectedEof);
+        }
+        let packet_type = message[0] >> 4;
+        match packet_type {
+            0x01 => {
+                let (packet, _) = ConnectPacket::decode(&message)?;
+                Ok(MqttMessage::Connect(packet))
+            }
+            0x08 => {
+                let (packet, _) = SubscribePacket::decode(&message)?;
+                Ok(MqttMessage::Subscribe(packet))
+            }
+            0x03 => {
+                let (packet, _) = PublishPacket::decode(&message)?;
+                Ok(MqttMessage::Publish(packet))
+            }
+            0x0C => Ok(MqttMessage::PingReq),
+            0x0E => Ok(MqttMessage::Disconnect),
+            _ => Err(ProtocolError::InvalidPacketType(packet_type)),
+        }
+    }
+
+    fn from_internal(response: Self::InternalResponse) -> Self::Outgoing {
+        match response {
+            MqttResponse::ConnAck(packet) => Ok(Some(packet.encode())),
+            MqttResponse::SubAck(packet) => packet.encode().map(Some),
+            MqttResponse::PubAck(packet) => packet.encode().map(Some),
+            MqttResponse::PingResp => Ok(Some(vec![0xD0, 0x00])),
+        }
+    }
 }
